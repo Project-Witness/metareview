@@ -31,46 +31,27 @@ Four layers:
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Requirements
+## Install
+
+One line:
+
+```bash
+brew install jq && bash <(curl -sSL https://raw.githubusercontent.com/Project-Witness/metareview/main/install.sh)
+```
+
+This installs `jq` (if needed), clones the plugin, registers it with Claude Code, copies scripts to `~/.metareview/`, and prompts to add shell integration. Press `Y` when asked, then run `source ~/.zshrc`.
+
+If you already have `jq`:
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/Project-Witness/metareview/main/install.sh)
+```
+
+### Requirements
 
 - macOS or Linux
-- `bash` 4+
-- `jq` — `brew install jq`
-- `python3` — for transcript cleaning
-- `ANTHROPIC_API_KEY` — only needed for LLM analysis tier (`metareview <id>`)
-
-## Installation
-
-### Option A: Claude Code plugin (recommended)
-
-```bash
-claude plugin install https://github.com/Project-Witness/metareview
-```
-
-The plugin auto-bootstraps `~/.metareview/` on first session start. After installing, add shell integration to `~/.zshrc`:
-
-```bash
-# Metareview — Claude Code session monitor
-export PATH="$HOME/.metareview/bin:$PATH"
-source "$HOME/.metareview/bin/claude-wrapper.sh"
-```
-
-Then reload: `source ~/.zshrc`
-
-### Option B: Manual install via curl
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Project-Witness/metareview/main/scripts/metareview-install | bash
-```
-
-Then add to `~/.zshrc`:
-
-```bash
-export PATH="$HOME/.metareview/bin:$PATH"
-source "$HOME/.metareview/bin/claude-wrapper.sh"
-```
-
-Reload: `source ~/.zshrc`
+- `jq` (installed automatically by the command above)
+- `ANTHROPIC_API_KEY` environment variable — only needed for the LLM analysis tier (`metareview <id>`). Not required for session capture or heuristic scoring.
 
 ## Usage
 
