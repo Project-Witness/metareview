@@ -99,6 +99,34 @@ for kb in "$PLUGIN_DIR/knowledge/"*.md; do
 done
 echo "  Knowledge base installed"
 
+# Copy skill to user's Claude skills directory
+SKILL_DIR="$HOME/.claude/skills/metareview"
+mkdir -p "$SKILL_DIR"
+cp "$PLUGIN_DIR/skills/metareview/SKILL.md" "$SKILL_DIR/"
+echo "  /metareview skill installed"
+
+# Add skill reference to CLAUDE.md
+CLAUDE_MD="$HOME/.claude/CLAUDE.md"
+if [[ -f "$CLAUDE_MD" ]]; then
+    if ! grep -q "metareview" "$CLAUDE_MD" 2>/dev/null; then
+        cat >> "$CLAUDE_MD" << 'CLAUDEMD'
+
+# metareview
+- **metareview** (`~/.claude/skills/metareview/SKILL.md`) - mid-session quality audit
+When the user types `/metareview`, invoke the Skill tool with `skill: "metareview"` before doing anything else.
+CLAUDEMD
+        echo "  Skill registered in CLAUDE.md"
+    fi
+else
+    mkdir -p "$HOME/.claude"
+    cat > "$CLAUDE_MD" << 'CLAUDEMD'
+# metareview
+- **metareview** (`~/.claude/skills/metareview/SKILL.md`) - mid-session quality audit
+When the user types `/metareview`, invoke the Skill tool with `skill: "metareview"` before doing anything else.
+CLAUDEMD
+    echo "  CLAUDE.md created with skill reference"
+fi
+
 # Write default config (preserve existing)
 if [[ ! -f "$MR_HOME/config.json" ]]; then
     cp "$PLUGIN_DIR/config.default.json" "$MR_HOME/config.json"
