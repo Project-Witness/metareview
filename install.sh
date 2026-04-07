@@ -119,13 +119,23 @@ echo ""
 if grep -q "metareview" "$HOME/.zshrc" 2>/dev/null; then
     echo -e "${GREEN}Shell integration already configured.${NC}"
 else
-    echo -e "${YELLOW}${BOLD}One more step — add these lines to your ~/.zshrc:${NC}"
-    echo ""
-    echo '  # Metareview — Claude Code session monitor'
-    echo '  export PATH="$HOME/.metareview/bin:$PATH"'
-    echo '  source "$HOME/.metareview/bin/claude-wrapper.sh"'
-    echo ""
-    echo -e "  Then run: ${BOLD}source ~/.zshrc${NC}"
+    echo -e -n "${CYAN}Add shell integration to ~/.zshrc? [Y/n] ${NC}"
+    read -r confirm < /dev/tty
+    if [[ ! "$confirm" =~ ^[Nn] ]]; then
+        cat >> "$HOME/.zshrc" << 'ZSHRC'
+
+# Metareview — Claude Code session monitor
+export PATH="$HOME/.metareview/bin:$PATH"
+source "$HOME/.metareview/bin/claude-wrapper.sh"
+ZSHRC
+        echo -e "  ${GREEN}Added to ~/.zshrc${NC}"
+        echo -e "  Run: ${BOLD}source ~/.zshrc${NC} to activate now"
+    else
+        echo ""
+        echo "  Add these lines to your shell config manually:"
+        echo '    export PATH="$HOME/.metareview/bin:$PATH"'
+        echo '    source "$HOME/.metareview/bin/claude-wrapper.sh"'
+    fi
 fi
 
 echo ""
