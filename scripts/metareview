@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# metareview — Main CLI entry point for the metareview tool.
+# Routes to all subcommands.
+#
+# Usage: metareview [command] [options]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Color codes
+# ─────────────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+VERSION="0.1.0"
+METAREVIEW_DIR="${HOME}/.metareview"
+SESSIONS_DIR="${METAREVIEW_DIR}/sessions"
+REVIEWS_DIR="${METAREVIEW_DIR}/reviews"
+CONFIG="${METAREVIEW_DIR}/config.json"
+HISTORY="${METAREVIEW_DIR}/history.json"
+BIN="${METAREVIEW_DIR}/bin"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+die() {
+  printf "${RED}Error: %s${NC}\n" "$*" >&2
+  exit 1
+}
+
+require_jq() {
+  command -v jq &>/dev/null || die "jq is required but not installed. Install with: brew install jq"
+}
+
+colorize_score() {
+  local score="$1"
+  case "$score" in
+    green)  printf "${GREEN}%s${NC}" "green"  ;;
+    yellow) printf "${YELLOW}%s${NC}" "yellow" ;;
+    red)    printf "${RED}%s${NC}" "red"    ;;
+    *)      printf "${DIM}%s${NC}" "${score:--}" ;;
+  esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_help — Print usage text
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_help() {
+  printf "${BOLD}metareview${NC} v${VERSION} — Claude Code session quality monitor\n\n"
+  printf "${BOLD}Usage:${NC}\n"
+  printf "  metareview                          Show this help\n"
+  printf "  metareview list [--red|--yellow]    Recent sessions with scores\n"
+  printf "  metareview <id> [--deep]            Run LLM analysis on a session\n"
+  printf "  metareview start <id>               New monitored claude session with NEXT-SESSION.md\n"
+  printf "  metareview config                   Open config.json in \$EDITOR\n"
+  printf "  metareview clean                    Run retention pruning\n"
+  printf "  metareview status                   Storage usage, session count, config summary\n"
+  printf "  metareview uninstall                Remove metareview completely\n"
+  printf "\n"
+  printf "${BOLD}Examples:${NC}\n"
+  printf "  metareview list\n"
+  printf "  metareview list --red\n"
+  printf "  metareview list --yellow\n"
+  printf "  metareview abc123def\n"
+  printf "  metareview abc123def --deep\n"
+  printf "  metareview start abc123def\n"
+  printf "  metareview status\n"
+  printf "  metareview clean\n"
+  printf "\n"
+  printf "${BOLD}Session IDs${NC} are shown in ${CYAN}metareview list${NC} output.\n"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_list — List recent sessions
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_list() {
+  require_jq
+
+  local filter="all"
+  for arg in "$@"; do
+    case "$arg" in
+      --red)    filter="red" ;;
+      --yellow) filter="yellow" ;;
+      --help|-h) printf "Usage: metareview list [--red|--yellow]\n"; return 0 ;;
+      *) die "Unknown option: $arg" ;;
+    esac
+  done
+
+  if [[ ! -f "$HISTORY" ]]; then
+    printf "${DIM}No session history found.${NC}\n"
+    return 0
+  fi
+
+  # Build jq filter expression
+  local jq_filter
+  case "$filter" in
+    red)    jq_filter='.[] | select(.score == "red")' ;;
+    yellow) jq_filter='.[] | select(.score == "red" or .score == "yellow")' ;;
+    *)      jq_filter='.[]' ;;
+  esac
+
+  # Extract sessions, sort newest first, limit to 20
+  local sessions
+  sessions=$(jq -r "
+    [ ${jq_filter} ] |
+    sort_by(.start_time) | reverse | .[0:20] |
+    .[] | [
+      .id,
+      (.start_time // \"-\"),
+      (.duration_seconds // 0 | tostring),
+      (.cwd // \"-\"),
+      (.score // \"-\")
+    ] | @tsv
+  " "$HISTORY" 2>/dev/null || true)
+
+  if [[ -z "$sessions" ]]; then
+    case "$filter" in
+      red)    printf "${DIM}No red sessions found.${NC}\n" ;;
+      yellow) printf "${DIM}No yellow or red sessions found.${NC}\n" ;;
+      *)      printf "${DIM}No sessions found.${NC}\n" ;;
+    esac
+    return 0
+  fi
+
+  # Count displayed sessions
+  local count
+  count=$(echo "$sessions" | wc -l | tr -d ' ')
+
+  # Header
+  printf "${BOLD}%-20s  %-19s  %-8s  %-38s  %s${NC}\n" \
+    "ID" "Date" "Duration" "CWD" "Score"
+  printf "%s\n" "$(printf '─%.0s' {1..100})"
+
+  # Rows
+  while IFS=$'\t' read -r id start_time duration_secs cwd score; do
+    # Format date
+    local date_fmt="-"
+    if [[ "$start_time" != "-" && -n "$start_time" ]]; then
+      date_fmt=$(date -r "$start_time" "+%Y-%m-%d %H:%M" 2>/dev/null || \
+                 date -d "@${start_time}" "+%Y-%m-%d %H:%M" 2>/dev/null || \
+                 echo "$start_time" | cut -c1-19)
+    fi
+
+    # Format duration
+    local dur_fmt="-"
+    if [[ "$duration_secs" =~ ^[0-9]+$ && "$duration_secs" -gt 0 ]]; then
+      local mins=$(( duration_secs / 60 ))
+      local secs=$(( duration_secs % 60 ))
+      if [[ $mins -ge 60 ]]; then
+        local hrs=$(( mins / 60 ))
+        mins=$(( mins % 60 ))
+        dur_fmt="${hrs}h${mins}m"
+      elif [[ $mins -gt 0 ]]; then
+        dur_fmt="${mins}m${secs}s"
+      else
+        dur_fmt="${secs}s"
+      fi
+    fi
+
+    # Truncate CWD to 38 chars
+    local cwd_short="$cwd"
+    if [[ ${#cwd} -gt 38 ]]; then
+      cwd_short="…${cwd: -37}"
+    fi
+
+    # Truncate ID to 20 chars
+    local id_short="${id:0:20}"
+
+    # Print row with colorized score
+    printf "%-20s  %-19s  %-8s  %-38s  " \
+      "$id_short" "$date_fmt" "$dur_fmt" "$cwd_short"
+    colorize_score "$score"
+    printf "\n"
+  done <<< "$sessions"
+
+  printf "\n${DIM}%d session(s) shown${NC}\n" "$count"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_analyze — Run LLM analysis on a session
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_analyze() {
+  local session_id="$1"
+  shift
+  local deep_flag=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      --deep) deep_flag="--deep" ;;
+      --help|-h) printf "Usage: metareview <id> [--deep]\n"; return 0 ;;
+      *) die "Unknown option: $arg" ;;
+    esac
+  done
+
+  local session_dir="${SESSIONS_DIR}/${session_id}"
+
+  if [[ ! -d "$session_dir" ]]; then
+    die "Session not found: ${session_id}\n  Expected: ${session_dir}"
+  fi
+
+  # If transcript.txt is missing, run clean-transcript first
+  if [[ ! -f "${session_dir}/transcript.txt" ]]; then
+    printf "${YELLOW}transcript.txt missing — running clean-transcript...${NC}\n"
+    if [[ -x "${BIN}/clean-transcript" ]]; then
+      "${BIN}/clean-transcript" "$session_dir" || die "clean-transcript failed"
+    else
+      die "clean-transcript not found at ${BIN}/clean-transcript"
+    fi
+  fi
+
+  # Confirm with user
+  printf "${BOLD}Analyze session:${NC} ${CYAN}${session_id}${NC}"
+  if [[ -n "$deep_flag" ]]; then
+    printf " ${YELLOW}(deep mode)${NC}"
+  fi
+  printf "\n"
+
+  local answer
+  read -rp "$(printf "${BOLD}Proceed? [y/N] ${NC}")" answer
+  case "$answer" in
+    [yY][eE][sS]|[yY]) ;;
+    *) printf "${DIM}Cancelled.${NC}\n"; return 0 ;;
+  esac
+
+  if [[ ! -x "${BIN}/llm-analyze" ]]; then
+    die "llm-analyze not found at ${BIN}/llm-analyze"
+  fi
+
+  printf "${CYAN}Running analysis...${NC}\n"
+  "${BIN}/llm-analyze" "$session_dir" $deep_flag
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_start — Start a new monitored session with NEXT-SESSION.md
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_start() {
+  if [[ $# -lt 1 ]]; then
+    printf "Usage: metareview start <id>\n" >&2
+    exit 1
+  fi
+
+  local session_id="$1"
+  local next_session_file="${REVIEWS_DIR}/${session_id}/NEXT-SESSION.md"
+
+  if [[ ! -f "$next_session_file" ]]; then
+    die "NEXT-SESSION.md not found for session: ${session_id}\n  Expected: ${next_session_file}"
+  fi
+
+  # Display first 20 lines in a box
+  printf "${BOLD}${CYAN}┌─────────────────────────────────────────────────────────┐${NC}\n"
+  printf "${BOLD}${CYAN}│ NEXT-SESSION.md — ${session_id}${NC}\n"
+  printf "${BOLD}${CYAN}└─────────────────────────────────────────────────────────┘${NC}\n"
+  head -20 "$next_session_file" | while IFS= read -r line; do
+    printf "  %s\n" "$line"
+  done
+  local total_lines
+  total_lines=$(wc -l < "$next_session_file" | tr -d ' ')
+  if [[ "$total_lines" -gt 20 ]]; then
+    printf "  ${DIM}... (%d more lines)${NC}\n" $(( total_lines - 20 ))
+  fi
+  printf "\n"
+
+  # Confirm with user
+  local answer
+  read -rp "$(printf "${BOLD}Start new claude session with this context? [y/N] ${NC}")" answer
+  case "$answer" in
+    [yY][eE][sS]|[yY]) ;;
+    *) printf "${DIM}Cancelled.${NC}\n"; return 0 ;;
+  esac
+
+  printf "${CYAN}Starting monitored claude session...${NC}\n"
+  # Pipe NEXT-SESSION.md content into claude -p
+  # This goes through the claude-wrapper, so the new session is monitored too
+  cat "$next_session_file" | claude -p
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_config — Open config.json in $EDITOR
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_config() {
+  local editor="${EDITOR:-vi}"
+  if [[ ! -f "$CONFIG" ]]; then
+    die "config.json not found at: ${CONFIG}"
+  fi
+  printf "${CYAN}Opening config in ${editor}...${NC}\n"
+  "$editor" "$CONFIG"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_clean — Run retention pruning
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_clean() {
+  require_jq
+
+  # Read retention config
+  local raw_log_days=7
+  local transcript_days=30
+
+  if [[ -f "$CONFIG" ]]; then
+    _rld=$(jq -r '.retention.raw_log_days // 7' "$CONFIG" 2>/dev/null || echo 7)
+    _trd=$(jq -r '.retention.transcript_days // 30' "$CONFIG" 2>/dev/null || echo 30)
+    [[ -n "$_rld" && "$_rld" != "null" ]] && raw_log_days="$_rld"
+    [[ -n "$_trd" && "$_trd" != "null" ]] && transcript_days="$_trd"
+  fi
+
+  printf "${BOLD}Running retention pruning...${NC}\n"
+  printf "  raw_log_days    = ${raw_log_days}\n"
+  printf "  transcript_days = ${transcript_days}\n\n"
+
+  local deleted_raw=0
+  local deleted_markers=0
+  local deleted_transcripts=0
+
+  # Delete raw.log files older than raw_log_days
+  while IFS= read -r -d '' f; do
+    rm -f "$f"
+    (( deleted_raw++ )) || true
+  done < <(find "${SESSIONS_DIR}" -name "raw.log" -mtime "+${raw_log_days}" -print0 2>/dev/null)
+
+  # Delete markers.jsonl files older than raw_log_days
+  while IFS= read -r -d '' f; do
+    rm -f "$f"
+    (( deleted_markers++ )) || true
+  done < <(find "${SESSIONS_DIR}" -name "markers.jsonl" -mtime "+${raw_log_days}" -print0 2>/dev/null)
+
+  # Delete transcript.txt files older than transcript_days
+  while IFS= read -r -d '' f; do
+    rm -f "$f"
+    (( deleted_transcripts++ )) || true
+  done < <(find "${SESSIONS_DIR}" -name "transcript.txt" -mtime "+${transcript_days}" -print0 2>/dev/null)
+
+  printf "${GREEN}Pruning complete:${NC}\n"
+  printf "  raw.log files deleted:       ${deleted_raw}\n"
+  printf "  markers.jsonl files deleted: ${deleted_markers}\n"
+  printf "  transcript.txt files deleted: ${deleted_transcripts}\n"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_status — Print storage usage and config summary
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_status() {
+  require_jq
+
+  printf "${BOLD}${CYAN}metareview${NC} ${DIM}v${VERSION}${NC}\n"
+  printf "%s\n" "$(printf '─%.0s' {1..50})"
+
+  # Session counts
+  local total_sessions=0
+  local reviewed_count=0
+  local green_count=0
+  local yellow_count=0
+  local red_count=0
+
+  if [[ -f "$HISTORY" ]]; then
+    total_sessions=$(jq 'length' "$HISTORY" 2>/dev/null || echo 0)
+    reviewed_count=$(jq '[.[] | select(.review_path != null and .review_path != "")] | length' "$HISTORY" 2>/dev/null || echo 0)
+    green_count=$(jq '[.[] | select(.score == "green")] | length' "$HISTORY" 2>/dev/null || echo 0)
+    yellow_count=$(jq '[.[] | select(.score == "yellow")] | length' "$HISTORY" 2>/dev/null || echo 0)
+    red_count=$(jq '[.[] | select(.score == "red")] | length' "$HISTORY" 2>/dev/null || echo 0)
+  fi
+
+  printf "\n${BOLD}Sessions${NC}\n"
+  printf "  Total:    %s\n" "$total_sessions"
+  printf "  Reviewed: %s\n" "$reviewed_count"
+  printf "  Scores:   "
+  printf "${GREEN}%s green${NC}  " "$green_count"
+  printf "${YELLOW}%s yellow${NC}  " "$yellow_count"
+  printf "${RED}%s red${NC}\n" "$red_count"
+
+  # Storage usage
+  printf "\n${BOLD}Storage${NC}\n"
+  if [[ -d "${METAREVIEW_DIR}/sessions" ]]; then
+    local sessions_size
+    sessions_size=$(du -sh "${METAREVIEW_DIR}/sessions" 2>/dev/null | cut -f1 || echo "?")
+    printf "  sessions/: %s\n" "$sessions_size"
+  else
+    printf "  sessions/: (empty)\n"
+  fi
+
+  if [[ -d "${METAREVIEW_DIR}/reviews" ]]; then
+    local reviews_size
+    reviews_size=$(du -sh "${METAREVIEW_DIR}/reviews" 2>/dev/null | cut -f1 || echo "?")
+    printf "  reviews/:  %s\n" "$reviews_size"
+  else
+    printf "  reviews/:  (empty)\n"
+  fi
+
+  # Config summary
+  printf "\n${BOLD}Config${NC}\n"
+  if [[ -f "$CONFIG" ]]; then
+    local capture_enabled auto_scan default_model
+    capture_enabled=$(jq -r '.capture.enabled // false' "$CONFIG" 2>/dev/null || echo "false")
+    auto_scan=$(jq -r '.heuristics.auto_run // false' "$CONFIG" 2>/dev/null || echo "false")
+    default_model=$(jq -r '.llm.default_model // "unknown"' "$CONFIG" 2>/dev/null || echo "unknown")
+
+    local capture_str auto_str
+    [[ "$capture_enabled" == "true" ]] && capture_str="${GREEN}enabled${NC}" || capture_str="${DIM}disabled${NC}"
+    [[ "$auto_scan" == "true" ]] && auto_str="${GREEN}enabled${NC}" || auto_str="${DIM}disabled${NC}"
+
+    printf "  Capture:       "; printf "${capture_str}\n"
+    printf "  Auto-scan:     "; printf "${auto_str}\n"
+    printf "  Default model: ${CYAN}%s${NC}\n" "$default_model"
+  else
+    printf "  ${DIM}(config.json not found)${NC}\n"
+  fi
+
+  printf "\n${DIM}Config: %s${NC}\n" "$CONFIG"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_uninstall — Remove metareview completely
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_uninstall() {
+  printf "${RED}${BOLD}WARNING: This will permanently remove metareview and all session data.${NC}\n\n"
+  printf "The following will be deleted:\n"
+  printf "  ${METAREVIEW_DIR}/\n"
+  printf "  ~/.claude/skills/metareview/\n"
+  printf "  ~/.claude/hooks/metareview-marker.sh\n"
+  printf "  metareview lines in ~/.zshrc\n\n"
+
+  local answer
+  read -rp "$(printf "${RED}${BOLD}Type 'yes' to confirm uninstall: ${NC}")" answer
+  if [[ "$answer" != "yes" ]]; then
+    printf "${DIM}Cancelled.${NC}\n"
+    return 0
+  fi
+
+  printf "\n${CYAN}Uninstalling metareview...${NC}\n"
+
+  # Remove ~/.metareview/
+  if [[ -d "$METAREVIEW_DIR" ]]; then
+    rm -rf "$METAREVIEW_DIR"
+    printf "  ${GREEN}✓${NC} Removed %s\n" "$METAREVIEW_DIR"
+  else
+    printf "  ${DIM}(skipped) %s not found${NC}\n" "$METAREVIEW_DIR"
+  fi
+
+  # Remove skill directory
+  local skill_dir="${HOME}/.claude/skills/metareview"
+  if [[ -d "$skill_dir" ]]; then
+    rm -rf "$skill_dir"
+    printf "  ${GREEN}✓${NC} Removed %s\n" "$skill_dir"
+  else
+    printf "  ${DIM}(skipped) %s not found${NC}\n" "$skill_dir"
+  fi
+
+  # Remove hook file
+  local hook_file="${HOME}/.claude/hooks/metareview-marker.sh"
+  if [[ -f "$hook_file" ]]; then
+    rm -f "$hook_file"
+    printf "  ${GREEN}✓${NC} Removed %s\n" "$hook_file"
+  else
+    printf "  ${DIM}(skipped) %s not found${NC}\n" "$hook_file"
+  fi
+
+  # Remove metareview lines from ~/.zshrc
+  local zshrc="${HOME}/.zshrc"
+  if [[ -f "$zshrc" ]]; then
+    # Remove lines containing metareview (PATH exports, aliases, etc.)
+    local lines_before lines_after
+    lines_before=$(wc -l < "$zshrc" | tr -d ' ')
+    sed -i.bak '/metareview/d' "$zshrc"
+    lines_after=$(wc -l < "$zshrc" | tr -d ' ')
+    local removed=$(( lines_before - lines_after ))
+    if [[ $removed -gt 0 ]]; then
+      printf "  ${GREEN}✓${NC} Removed %d metareview line(s) from ~/.zshrc\n" "$removed"
+    else
+      printf "  ${DIM}(skipped) No metareview lines found in ~/.zshrc${NC}\n"
+    fi
+  fi
+
+  printf "\n${GREEN}${BOLD}metareview has been uninstalled.${NC}\n"
+  printf "${DIM}Restart your shell to apply PATH changes.${NC}\n"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main router
+# ─────────────────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"
+
+  case "$cmd" in
+    help|--help|-h)
+      cmd_help
+      ;;
+    list)
+      shift
+      cmd_list "$@"
+      ;;
+    start)
+      shift
+      cmd_start "$@"
+      ;;
+    config)
+      cmd_config
+      ;;
+    clean)
+      cmd_clean
+      ;;
+    status)
+      cmd_status
+      ;;
+    uninstall)
+      cmd_uninstall
+      ;;
+    -*)
+      die "Unknown option: ${cmd}. Run 'metareview help' for usage."
+      ;;
+    *)
+      # Assume it's a session ID — route to analyze
+      cmd_analyze "$@"
+      ;;
+  esac
+}
+
+main "$@"

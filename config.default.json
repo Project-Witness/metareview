@@ -1,0 +1,26 @@
+{
+  "capture": {
+    "enabled": true,
+    "pipe_mode_capture": true
+  },
+  "heuristics": {
+    "auto_run": true,
+    "thresholds": {
+      "green_max": 4,
+      "yellow_max": 9
+    }
+  },
+  "llm": {
+    "auto_trigger_on_red": false,
+    "default_model": "claude-sonnet-4-6",
+    "deep_model": "claude-opus-4-6",
+    "realtime_model": "claude-haiku-4-5-20251001",
+    "max_cost_usd": 1.00
+  },
+  "retention": {
+    "raw_log_days": 7,
+    "transcript_days": 30,
+    "reviews": "forever"
+  },
+  "knowledge_token_budget": 10000
+}

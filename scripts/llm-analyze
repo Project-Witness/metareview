@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# llm-analyze — Deep LLM-powered analysis of a metareview session.
+# Calls the Anthropic Messages API and splits the response into
+# REVIEW.md and NEXT-SESSION.md.
+#
+# Usage: llm-analyze <session-dir> [--deep] [--dry-run]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Colors
+# ─────────────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────────────────────
+SESSION_DIR=""
+DEEP=false
+DRY_RUN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --deep)    DEEP=true ;;
+    --dry-run) DRY_RUN=true ;;
+    -*)
+      printf "${RED}Unknown flag: %s${NC}\n" "$arg" >&2
+      echo "Usage: llm-analyze <session-dir> [--deep] [--dry-run]" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "$SESSION_DIR" ]]; then
+        SESSION_DIR="$arg"
+      else
+        printf "${RED}Unexpected argument: %s${NC}\n" "$arg" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$SESSION_DIR" ]]; then
+  echo "Usage: llm-analyze <session-dir> [--deep] [--dry-run]" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+CONFIG="${HOME}/.metareview/config.json"
+REVIEWS_BASE="${HOME}/.metareview/reviews"
+HISTORY="${HOME}/.metareview/history.json"
+BIN="${HOME}/.metareview/bin"
+SESSION_ID=$(basename "$SESSION_DIR")
+TRANSCRIPT="${SESSION_DIR}/transcript.txt"
+META="${SESSION_DIR}/meta.json"
+REVIEW_DIR="${REVIEWS_BASE}/${SESSION_ID}"
+REVIEW_MD="${REVIEW_DIR}/REVIEW.md"
+NEXT_SESSION_MD="${REVIEW_DIR}/NEXT-SESSION.md"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1: Determine model
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_MODEL="claude-sonnet-4-6"
+DEEP_MODEL="claude-opus-4-6"
+
+if command -v jq &>/dev/null && [[ -f "$CONFIG" ]]; then
+  _dm=$(jq -r '.llm.default_model // empty' "$CONFIG" 2>/dev/null || true)
+  _om=$(jq -r '.llm.deep_model // empty' "$CONFIG" 2>/dev/null || true)
+  [[ -n "$_dm" ]] && DEFAULT_MODEL="$_dm"
+  [[ -n "$_om" ]] && DEEP_MODEL="$_om"
+fi
+
+if [[ "$DEEP" == "true" ]]; then
+  MODEL="$DEEP_MODEL"
+else
+  MODEL="$DEFAULT_MODEL"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2: Check API key
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  printf "${RED}Error: ANTHROPIC_API_KEY environment variable is not set.${NC}\n" >&2
+  printf "${RED}Export it before running: export ANTHROPIC_API_KEY=sk-ant-...${NC}\n" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3: Check session dir and transcript
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ ! -d "$SESSION_DIR" ]]; then
+  printf "${RED}Error: session directory not found: %s${NC}\n" "$SESSION_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -f "$TRANSCRIPT" ]]; then
+  printf "${RED}Error: transcript.txt not found in session dir: %s${NC}\n" "$SESSION_DIR" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4: Estimate cost
+# ─────────────────────────────────────────────────────────────────────────────
+TRANSCRIPT_CHARS=$(wc -c < "$TRANSCRIPT" | tr -d ' ')
+ESTIMATED_TOKENS=$(( TRANSCRIPT_CHARS / 4 ))
+
+# Cost per 1M tokens (USD)
+if [[ "$DEEP" == "true" ]]; then
+  COST_PER_M=15
+else
+  COST_PER_M=3
+fi
+
+# Integer math: cost_usd_cents = (tokens * cost_per_m * 100) / 1_000_000
+COST_CENTS=$(( ESTIMATED_TOKENS * COST_PER_M * 100 / 1000000 ))
+COST_USD_INT=$(( COST_CENTS / 100 ))
+COST_USD_FRAC=$(( COST_CENTS % 100 ))
+
+printf "${CYAN}[llm-analyze]${NC} Session: ${BOLD}%s${NC}\n" "$SESSION_ID"
+printf "${CYAN}[llm-analyze]${NC} Model: ${BOLD}%s${NC}\n" "$MODEL"
+printf "${CYAN}[llm-analyze]${NC} Transcript: ~%d tokens (estimated input cost: \$%d.%02d)\n" \
+  "$ESTIMATED_TOKENS" "$COST_USD_INT" "$COST_USD_FRAC"
+
+# Check against max_cost_usd from config
+MAX_COST_CENTS=100  # default $1.00
+if command -v jq &>/dev/null && [[ -f "$CONFIG" ]]; then
+  _mc=$(jq -r '.llm.max_cost_usd // empty' "$CONFIG" 2>/dev/null || true)
+  if [[ -n "$_mc" && "$_mc" != "null" ]]; then
+    # Convert float to cents using awk (pass variable safely)
+    MAX_COST_CENTS=$(awk -v v="$_mc" 'BEGIN { printf "%d", v * 100 }')
+  fi
+fi
+
+if [[ "$COST_CENTS" -gt "$MAX_COST_CENTS" ]]; then
+  MAX_COST_INT=$(( MAX_COST_CENTS / 100 ))
+  MAX_COST_FRAC=$(( MAX_COST_CENTS % 100 ))
+  printf "${RED}Error: Estimated cost \$%d.%02d exceeds max_cost_usd \$%d.%02d in config.${NC}\n" \
+    "$COST_USD_INT" "$COST_USD_FRAC" "$MAX_COST_INT" "$MAX_COST_FRAC" >&2
+  printf "${RED}Use --deep sparingly, or increase llm.max_cost_usd in ~/.metareview/config.json.${NC}\n" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 5: Run env-scan
+# ─────────────────────────────────────────────────────────────────────────────
+ENV_SCAN_BIN="${BIN}/env-scan"
+ENV_INVENTORY=""
+
+if [[ -x "$ENV_SCAN_BIN" ]]; then
+  printf "${CYAN}[llm-analyze]${NC} Running env-scan...\n"
+  ENV_INVENTORY=$("$ENV_SCAN_BIN" "$SESSION_DIR" 2>/dev/null || true)
+else
+  printf "${CYAN}[llm-analyze]${NC} env-scan not found or not executable, skipping.\n"
+  ENV_INVENTORY="(env-scan not available)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 6: Read heuristic data from meta.json
+# ─────────────────────────────────────────────────────────────────────────────
+HEURISTIC_JSON='{}'
+if [[ -f "$META" ]] && command -v jq &>/dev/null; then
+  _hj=$(jq -r '.heuristic_score // {} | @json' "$META" 2>/dev/null || true)
+  [[ -n "$_hj" ]] && HEURISTIC_JSON="$_hj"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 7: Build system prompt
+# ─────────────────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT=$(cat <<'SYSPROMPT'
+You are a senior Claude Code (CC) session auditor for the metareview system. Your job is to analyze a raw CC session transcript and produce two deliverables: a comprehensive session review and a focused next-session brief.
+
+You will be given:
+1. An environment inventory (installed plugins, skills, hooks, CLAUDE.md content, prior reviews)
+2. A heuristic pre-scan (pattern-matching scores for common failure signals)
+3. The full session transcript
+
+Your analysis should be thorough, direct, and actionable. Identify both strengths and failure modes. Be specific — cite exact turns where patterns occur.
+
+## Evaluation Dimensions
+
+1. **Delivery Integrity**: Did CC deliver everything it committed to? Did it verify its own work?
+2. **Communication Quality**: Did CC understand intent on first reading? Did it address substance or just surface?
+3. **Process & Tool Usage**: Were relevant skills and tools invoked? Were plans written and tasks created?
+4. **User Interaction Patterns**: Did user have to repeat themselves? Could requests have been structured better?
+5. **Session Trajectory**: Did session maintain focus? At what point did quality degrade?
+
+## Known Anti-Patterns to Watch For
+- The Eager Completer (claims done without verification)
+- The Apologetic Repeater (apologizes then repeats same mistake)
+- The Scope Creeper (adds unrequested work)
+- The Context Amnesia (forgets earlier instructions)
+- The Verbose Deflector (more words, less substance)
+- The Plan Abandoner (states plan, abandons later items)
+
+## Output Format
+
+You MUST output exactly two blocks with these delimiters, with no extra text before or after:
+
+===REVIEW_START===
+[Full REVIEW.md content here]
+===REVIEW_END===
+===NEXT_SESSION_START===
+[NEXT-SESSION.md content here — max 500 words, focused on actionable setup for the next session]
+===NEXT_SESSION_END===
+
+## REVIEW.md Structure
+
+Use this exact structure:
+
+# Session Review: [session-id]
+
+**Date:** [date from meta if available]
+**Project:** [cwd from meta if available]
+**Goal:** [inferred from transcript — one sentence]
+**Duration:** [from meta if available]
+**Heuristic Score:** [from pre-scan data]
+
+---
+
+## Summary
+
+[2-3 sentence overview of what happened in the session]
+
+**Severity:** [green | yellow | red]
+**Root Cause:** [one-sentence diagnosis of the primary failure, or "none — session was clean"]
+
+---
+
+## Dimension Scores
+
+| Dimension | Score | Notes |
+|-----------|-------|-------|
+| Delivery Integrity | [Strong/Adequate/Weak] | [brief note] |
+| Communication Quality | [Strong/Adequate/Weak] | [brief note] |
+| Process & Tool Usage | [Strong/Adequate/Weak] | [brief note] |
+| User Interaction Patterns | [Strong/Adequate/Weak] | [brief note] |
+| Session Trajectory | [Strong/Adequate/Weak] | [brief note] |
+
+---
+
+## Findings
+
+### What Went Well
+[Bullet points of positive patterns observed]
+
+### Anti-Patterns Detected
+[For each pattern found: name, description of occurrence, turn reference]
+
+### Notable Moments
+[Specific turns where quality was especially high or low — be precise]
+
+---
+
+## Recommendations
+
+### For CC
+[Actionable suggestions for improving CC behavior]
+
+### For User
+[Suggestions for how user could structure prompts or sessions more effectively]
+
+---
+
+## NEXT-SESSION.md Structure
+
+Use this exact structure:
+
+# Next Session Brief
+
+**From session:** [session-id]
+**Key finding:** [one sentence]
+
+## Carry Forward
+
+[Bullet list of unfinished items, open questions, or decisions that need revisiting in next session]
+
+## Watch For
+
+[Bullet list of specific CC behaviors to monitor, based on patterns seen in this session]
+
+## Suggested Session Start
+
+[1-2 sentences the user could paste at the start of their next session to orient CC with context]
+SYSPROMPT
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 8: Build user prompt
+# ─────────────────────────────────────────────────────────────────────────────
+TRANSCRIPT_CONTENT=$(cat "$TRANSCRIPT")
+
+USER_PROMPT="# Environment Inventory
+
+${ENV_INVENTORY}
+
+---
+
+# Heuristic Pre-Scan
+
+\`\`\`json
+${HEURISTIC_JSON}
+\`\`\`
+
+---
+
+# Full Session Transcript
+
+${TRANSCRIPT_CONTENT}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dry-run: print prompt stats and exit
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$DRY_RUN" == "true" ]]; then
+  USER_PROMPT_CHARS=$(printf '%s' "$USER_PROMPT" | wc -c | tr -d ' ')
+  SYSTEM_PROMPT_CHARS=$(printf '%s' "$SYSTEM_PROMPT" | wc -c | tr -d ' ')
+  TOTAL_CHARS=$(( USER_PROMPT_CHARS + SYSTEM_PROMPT_CHARS ))
+
+  printf "\n${BOLD}[dry-run] Prompt stats:${NC}\n"
+  printf "  System prompt: %d chars (~%d tokens)\n" "$SYSTEM_PROMPT_CHARS" "$(( SYSTEM_PROMPT_CHARS / 4 ))"
+  printf "  User prompt:   %d chars (~%d tokens)\n" "$USER_PROMPT_CHARS" "$(( USER_PROMPT_CHARS / 4 ))"
+  printf "  Total:         %d chars (~%d tokens)\n" "$TOTAL_CHARS" "$(( TOTAL_CHARS / 4 ))"
+  printf "\n${BOLD}[dry-run] JSON body would be built via jq and POSTed to:${NC}\n"
+  printf "  https://api.anthropic.com/v1/messages\n"
+  printf "\n${BOLD}[dry-run] Output would be written to:${NC}\n"
+  printf "  %s\n" "$REVIEW_MD"
+  printf "  %s\n" "$NEXT_SESSION_MD"
+  printf "\n${CYAN}[dry-run] No API call made.${NC}\n"
+  exit 0
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 9: Call Anthropic Messages API
+# ─────────────────────────────────────────────────────────────────────────────
+printf "${CYAN}[llm-analyze]${NC} Calling Anthropic API (model: %s, max_tokens: 8192)...\n" "$MODEL"
+
+# Build JSON body safely using jq --arg (never raw string interpolation)
+REQUEST_BODY=$(jq -n \
+  --arg model "$MODEL" \
+  --arg system "$SYSTEM_PROMPT" \
+  --arg user_content "$USER_PROMPT" \
+  '{
+    model: $model,
+    max_tokens: 8192,
+    system: $system,
+    messages: [
+      {
+        role: "user",
+        content: $user_content
+      }
+    ]
+  }')
+
+# Make the API call, capture HTTP status separately
+HTTP_RESPONSE=$(mktemp)
+HTTP_STATUS=$(curl -s -o "$HTTP_RESPONSE" -w "%{http_code}" \
+  --max-time 300 \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+  -H "anthropic-version: 2023-06-01" \
+  -d "$REQUEST_BODY" \
+  "https://api.anthropic.com/v1/messages" || echo "000")
+
+RESPONSE_BODY=$(cat "$HTTP_RESPONSE")
+rm -f "$HTTP_RESPONSE"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 10: Parse response
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$HTTP_STATUS" != "200" ]]; then
+  printf "${RED}Error: API returned HTTP %s${NC}\n" "$HTTP_STATUS" >&2
+  if [[ -n "$RESPONSE_BODY" ]]; then
+    ERROR_MSG=$(printf '%s' "$RESPONSE_BODY" | jq -r '.error.message // .error // "unknown error"' 2>/dev/null || echo "$RESPONSE_BODY")
+    printf "${RED}API error: %s${NC}\n" "$ERROR_MSG" >&2
+  fi
+  exit 1
+fi
+
+if [[ -z "$RESPONSE_BODY" ]]; then
+  printf "${RED}Error: Empty response from API.${NC}\n" >&2
+  exit 1
+fi
+
+# Extract the text content from the response
+LLM_OUTPUT=$(printf '%s' "$RESPONSE_BODY" | jq -r '.content[0].text // empty' 2>/dev/null || true)
+
+if [[ -z "$LLM_OUTPUT" ]]; then
+  printf "${RED}Error: Could not extract content from API response.${NC}\n" >&2
+  printf "${RED}Raw response: %s${NC}\n" "$RESPONSE_BODY" >&2
+  exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 11: Split output into REVIEW.md and NEXT-SESSION.md
+# ─────────────────────────────────────────────────────────────────────────────
+mkdir -p "$REVIEW_DIR"
+
+# Check for expected delimiters
+HAS_REVIEW_DELIM=false
+HAS_NEXT_DELIM=false
+
+printf '%s' "$LLM_OUTPUT" | grep -q '===REVIEW_START===' && HAS_REVIEW_DELIM=true || true
+printf '%s' "$LLM_OUTPUT" | grep -q '===NEXT_SESSION_START===' && HAS_NEXT_DELIM=true || true
+
+if [[ "$HAS_REVIEW_DELIM" == "true" && "$HAS_NEXT_DELIM" == "true" ]]; then
+  # Extract REVIEW.md content between delimiters
+  REVIEW_CONTENT=$(printf '%s' "$LLM_OUTPUT" | \
+    sed -n '/===REVIEW_START===/,/===REVIEW_END===/p' | \
+    sed '1d;$d')
+
+  # Extract NEXT-SESSION.md content between delimiters
+  NEXT_SESSION_CONTENT=$(printf '%s' "$LLM_OUTPUT" | \
+    sed -n '/===NEXT_SESSION_START===/,/===NEXT_SESSION_END===/p' | \
+    sed '1d;$d')
+
+  printf '%s\n' "$REVIEW_CONTENT" > "$REVIEW_MD"
+  printf '%s\n' "$NEXT_SESSION_CONTENT" > "$NEXT_SESSION_MD"
+else
+  # Fallback: write entire response as REVIEW.md
+  printf "${RED}Warning: Expected delimiters not found in response. Writing raw output to REVIEW.md.${NC}\n" >&2
+  printf '%s\n' "$LLM_OUTPUT" > "$REVIEW_MD"
+
+  # Write a fallback NEXT-SESSION.md
+  cat > "$NEXT_SESSION_MD" <<FALLBACK
+# Next Session Brief
+
+**From session:** ${SESSION_ID}
+**Note:** This brief was auto-generated as a fallback because the LLM response did not contain the expected delimiters. Review REVIEW.md for full output.
+
+## Carry Forward
+
+- Review the full analysis in REVIEW.md
+- Address any open items identified in the session
+
+## Watch For
+
+- Any recurring patterns identified in the session transcript
+
+## Suggested Session Start
+
+Review the session analysis in REVIEW.md before beginning. Address any carry-forward items from the previous session.
+FALLBACK
+fi
+
+# Copy meta.json into review dir for prior-review lookups by env-scan
+if [[ -f "$META" ]]; then
+  cp "$META" "${REVIEW_DIR}/meta.json" 2>/dev/null || true
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 12: Update meta.json — set reviewed: true
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ -f "$META" ]] && command -v jq &>/dev/null; then
+  _tmp=$(mktemp "${META}.XXXXXX")
+  jq '. + {reviewed: true}' "$META" > "$_tmp" 2>/dev/null && mv "$_tmp" "$META" || { rm -f "$_tmp" || true; }
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 13: Update history.json — set reviewed: true for this session ID
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ -f "$HISTORY" ]] && command -v jq &>/dev/null; then
+  _tmp=$(mktemp "${HISTORY}.XXXXXX")
+  jq --arg id "$SESSION_ID" \
+    'map(if .id == $id then . + {reviewed: true} else . end)' \
+    "$HISTORY" > "$_tmp" 2>/dev/null && mv "$_tmp" "$HISTORY" || { rm -f "$_tmp" || true; }
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 14: Print summary
+# ─────────────────────────────────────────────────────────────────────────────
+printf "\n${BOLD}[llm-analyze]${NC} Analysis complete.\n"
+printf "  REVIEW.md:        %s\n" "$REVIEW_MD"
+printf "  NEXT-SESSION.md:  %s\n" "$NEXT_SESSION_MD"
+
+# Extract Goal, Severity, and Root Cause from REVIEW.md
+if [[ -f "$REVIEW_MD" ]]; then
+  SESSION_GOAL=$(grep -m1 '^\*\*Goal:\*\*' "$REVIEW_MD" 2>/dev/null | sed 's/\*\*Goal:\*\* *//' || true)
+  SEVERITY=$(grep -m1 '^\*\*Severity:\*\*' "$REVIEW_MD" 2>/dev/null | sed 's/\*\*Severity:\*\* *//' || true)
+  ROOT_CAUSE=$(grep -m1 '^\*\*Root Cause:\*\*' "$REVIEW_MD" 2>/dev/null | sed 's/\*\*Root Cause:\*\* *//' || true)
+
+  [[ -n "$SESSION_GOAL" ]] && printf "\n  ${BOLD}Goal:${NC}       %s\n" "$SESSION_GOAL"
+  if [[ -n "$SEVERITY" ]]; then
+    case "$SEVERITY" in
+      *red*)    printf "  ${BOLD}Severity:${NC}   ${RED}%s${NC}\n" "$SEVERITY" ;;
+      *yellow*) printf "  ${BOLD}Severity:${NC}   %s\n" "$SEVERITY" ;;
+      *green*)  printf "  ${BOLD}Severity:${NC}   %s\n" "$SEVERITY" ;;
+      *)        printf "  ${BOLD}Severity:${NC}   %s\n" "$SEVERITY" ;;
+    esac
+  fi
+  [[ -n "$ROOT_CAUSE" ]] && printf "  ${BOLD}Root Cause:${NC} %s\n" "$ROOT_CAUSE"
+fi
+
+printf "\n"

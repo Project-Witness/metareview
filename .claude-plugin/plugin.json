@@ -1,0 +1,12 @@
+{
+  "name": "metareview",
+  "description": "Claude Code session quality auditor — captures conversations, detects degradation patterns, and produces diagnostic reports with actionable starter prompts for next sessions",
+  "version": "0.1.0",
+  "author": {
+    "name": "Israel Bitton"
+  },
+  "homepage": "https://github.com/Project-Witness/metareview",
+  "repository": "https://github.com/Project-Witness/metareview",
+  "license": "MIT",
+  "keywords": ["quality", "audit", "session", "review", "debugging"]
+}

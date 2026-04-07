@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# heuristics — Pattern-matching quality analysis on cleaned transcripts.
+# Reads <session-dir>/transcript.txt and outputs a JSON score object to stdout.
+#
+# Usage: heuristics <session-dir>
+
+# ---------------------------------------------------------------------------
+# Argument validation
+# ---------------------------------------------------------------------------
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: heuristics <session-dir>" >&2
+  exit 1
+fi
+
+SESSION_DIR="$1"
+TRANSCRIPT="${SESSION_DIR}/transcript.txt"
+CONFIG="${HOME}/.metareview/config.json"
+
+if [[ ! -d "$SESSION_DIR" ]]; then
+  echo "Error: session directory not found: $SESSION_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -f "$TRANSCRIPT" ]]; then
+  echo "Error: transcript.txt not found: $TRANSCRIPT" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Read thresholds from config.json (with defaults if config missing)
+# ---------------------------------------------------------------------------
+
+GREEN_MAX=4
+YELLOW_MAX=9
+
+if command -v jq &>/dev/null && [[ -f "$CONFIG" ]]; then
+  _gm=$(jq -r '.heuristics.thresholds.green_max // empty' "$CONFIG" 2>/dev/null || true)
+  _ym=$(jq -r '.heuristics.thresholds.yellow_max // empty' "$CONFIG" 2>/dev/null || true)
+  [[ -n "$_gm" ]] && GREEN_MAX="$_gm"
+  [[ -n "$_ym" ]] && YELLOW_MAX="$_ym"
+fi
+
+# ---------------------------------------------------------------------------
+# Parse transcript into parallel arrays of speaker blocks
+# ---------------------------------------------------------------------------
+# speakers[i]  = "user" or "assistant"
+# blocks[i]    = text content of that block
+
+declare -a speakers=()
+declare -a blocks=()
+
+current_speaker=""
+current_block=""
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" == "--- USER ---" ]]; then
+    if [[ -n "$current_speaker" ]]; then
+      speakers+=("$current_speaker")
+      blocks+=("$current_block")
+    fi
+    current_speaker="user"
+    current_block=""
+  elif [[ "$line" == "--- ASSISTANT ---" ]]; then
+    if [[ -n "$current_speaker" ]]; then
+      speakers+=("$current_speaker")
+      blocks+=("$current_block")
+    fi
+    current_speaker="assistant"
+    current_block=""
+  else
+    if [[ -n "$current_speaker" ]]; then
+      current_block+="${line}"$'\n'
+    fi
+  fi
+done < "$TRANSCRIPT"
+
+# flush final block
+if [[ -n "$current_speaker" ]]; then
+  speakers+=("$current_speaker")
+  blocks+=("$current_block")
+fi
+
+TOTAL="${#speakers[@]}"
+
+# ---------------------------------------------------------------------------
+# Helper: count pattern occurrences in a string (case-insensitive).
+# Uses { grep ... || true; } inside the pipeline so that when grep finds no
+# matches (exit 1), pipefail does NOT fire — preventing the double-output bug
+# where wc -l outputs "0" AND the fallback "|| echo 0" also outputs "0".
+# ---------------------------------------------------------------------------
+count_pattern() {
+  local text="$1"
+  local pattern="$2"
+  printf '%s' "$text" | { /usr/bin/grep -oiE "$pattern" 2>/dev/null || true; } | wc -l | tr -d ' '
+}
+
+# ---------------------------------------------------------------------------
+# Helper: test if a string contains a pattern (boolean, no side-effects).
+# Returns 0 (true) if matched, 1 if not.
+# ---------------------------------------------------------------------------
+has_pattern() {
+  local text="$1"
+  local pattern="$2"
+  printf '%s' "$text" | /usr/bin/grep -qiE "$pattern" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Helper: unique lowercased words from a string, one per line, sorted.
+# ---------------------------------------------------------------------------
+unique_words() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z' '\n' | \
+    { /usr/bin/grep -v '^$' 2>/dev/null || true; } | sort -u
+}
+
+# Jaccard-style similarity: (shared unique words / union unique words) × 100 as int %
+word_similarity() {
+  local a="$1"
+  local b="$2"
+  local shared ua ub union
+  shared=$(comm -12 \
+    <(unique_words "$a") \
+    <(unique_words "$b") | wc -l | tr -d ' ')
+  ua=$(unique_words "$a" | wc -l | tr -d ' ')
+  ub=$(unique_words "$b" | wc -l | tr -d ' ')
+  union=$(( ua + ub - shared ))
+  if [[ "$union" -eq 0 ]]; then
+    echo 0
+  else
+    echo $(( shared * 100 / union ))
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Signal 1: Correction Cycles
+# +2 each; +3 extra bonus if 2+ corrections on the same topic
+# ---------------------------------------------------------------------------
+CORRECTION_CYCLES=0
+declare -A _correction_topic_count=()
+
+CORRECTION_MARKERS='(you didn.t|you missed|still didn.t|I said|I asked you to|what about|but you|that.s not what I|where is the|there.s no)'
+COMPLETION_MARKERS='(^Done[.!]?$|I.ve (set up|created|added|implemented|configured)|^Completed[.!]?$|Here.s the)'
+
+for (( i=1; i<TOTAL; i++ )); do
+  if [[ "${speakers[$i]}" != "user" ]]; then continue; fi
+
+  user_block="${blocks[$i]}"
+  prev_block="${blocks[$((i-1))]}"
+  prev_speaker="${speakers[$((i-1))]}"
+
+  if [[ "$prev_speaker" != "assistant" ]]; then continue; fi
+
+  user_corrections=$(count_pattern "$user_block" "$CORRECTION_MARKERS")
+  asst_completions=$(count_pattern "$prev_block" "$COMPLETION_MARKERS")
+
+  if [[ "$user_corrections" -gt 0 && "$asst_completions" -gt 0 ]]; then
+    # Extract a rough topic key from the first 40 chars of the user block
+    topic_key=$(printf '%s' "$user_block" | tr '[:upper:]' '[:lower:]' | \
+      tr -cs 'a-z' ' ' | tr -s ' ' | cut -c1-40 | tr ' ' '_')
+    _correction_topic_count["$topic_key"]=$(( ${_correction_topic_count["$topic_key"]:-0} + 1 ))
+    CORRECTION_CYCLES=$(( CORRECTION_CYCLES + 1 ))
+  fi
+done
+
+# Extra +3 if any topic had 2+ corrections on the same topic
+CORRECTION_BONUS=0
+for key in "${!_correction_topic_count[@]}"; do
+  if [[ "${_correction_topic_count[$key]}" -ge 2 ]]; then
+    CORRECTION_BONUS=$(( CORRECTION_BONUS + 3 ))
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Signal 2: Sorry Loops (+3 each)
+# Two consecutive assistant blocks that both apologize AND share many words.
+# ---------------------------------------------------------------------------
+SORRY_LOOPS=0
+
+APOLOGY_MARKERS='(Sorry[,!.]?|Apologies[,!.]?|You.re right|I missed|My mistake)'
+SIMILARITY_THRESHOLD=30  # >30% shared unique words = "high similarity"
+
+# Collect assistant block indices
+declare -a asst_indices=()
+for (( i=0; i<TOTAL; i++ )); do
+  if [[ "${speakers[$i]}" == "assistant" ]]; then
+    asst_indices+=("$i")
+  fi
+done
+
+NASST="${#asst_indices[@]}"
+for (( j=1; j<NASST; j++ )); do
+  prev_idx="${asst_indices[$((j-1))]}"
+  curr_idx="${asst_indices[$j]}"
+  prev_asst="${blocks[$prev_idx]}"
+  curr_asst="${blocks[$curr_idx]}"
+
+  prev_apology=$(count_pattern "$prev_asst" "$APOLOGY_MARKERS")
+  curr_apology=$(count_pattern "$curr_asst" "$APOLOGY_MARKERS")
+
+  if [[ "$prev_apology" -gt 0 && "$curr_apology" -gt 0 ]]; then
+    sim=$(word_similarity "$prev_asst" "$curr_asst")
+    if [[ "$sim" -gt "$SIMILARITY_THRESHOLD" ]]; then
+      SORRY_LOOPS=$(( SORRY_LOOPS + 1 ))
+    fi
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Signal 3: Frustration Markers (+2 per event where block scores 3+)
+# ---------------------------------------------------------------------------
+FRUSTRATION_SIGNALS=0
+
+# Common acronyms to exclude from ALL-CAPS detection
+CAPS_EXCLUDE='^(API|SQL|URL|HTTP|HTTPS|HTML|CSS|JSON|XML|JWT|CLI|GUI|UI|UX|DB|IO|ID|OS|SDK|AI|ML|DI|CI|CD|PR|QA|SSR|CSR|ENV|AWS|GCP|GIT|NPM|SSH|DNS|TCP|IP|OK|NO|YES|EOF|GNU|MIT)$'
+
+for (( i=0; i<TOTAL; i++ )); do
+  if [[ "${speakers[$i]}" != "user" ]]; then continue; fi
+  block="${blocks[$i]}"
+  block_score=0
+
+  # Profanity words (+2 each)
+  profanity=$(count_pattern "$block" '\b(fuck|shit|damn|hell|crap|ass|bastard|bitch|bullshit|wtf)\b')
+  block_score=$(( block_score + profanity * 2 ))
+
+  # ALL CAPS words 3+ chars excluding common acronyms (+1 each)
+  caps_count=0
+  while IFS= read -r word; do
+    [[ -z "$word" ]] && continue
+    # Skip known acronyms
+    if printf '%s' "$word" | /usr/bin/grep -qE "$CAPS_EXCLUDE" 2>/dev/null; then continue; fi
+    caps_count=$(( caps_count + 1 ))
+  done < <(printf '%s' "$block" | { /usr/bin/grep -oE '[A-Z]{3,}' 2>/dev/null || true; })
+  block_score=$(( block_score + caps_count ))
+
+  # Repeated punctuation !! or ?? (+1 each occurrence)
+  repeated_punct=$(count_pattern "$block" '(!{2,}|\?{2,})')
+  block_score=$(( block_score + repeated_punct ))
+
+  # "I already told you" (+3)
+  already_told=$(count_pattern "$block" 'I already told you')
+  block_score=$(( block_score + already_told * 3 ))
+
+  # "again" at sentence start (+2 each)
+  again_start=$(count_pattern "$block" '(^|[.!?][[:space:]]+)[Aa]gain[[:space:]]')
+  block_score=$(( block_score + again_start * 2 ))
+
+  # "how many times" (+3)
+  how_many=$(count_pattern "$block" 'how many times')
+  block_score=$(( block_score + how_many * 3 ))
+
+  if [[ "$block_score" -ge 3 ]]; then
+    FRUSTRATION_SIGNALS=$(( FRUSTRATION_SIGNALS + 1 ))
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Signal 4: Plan-Delivery Mismatch (+3 per undelivered item user asked about)
+# ---------------------------------------------------------------------------
+UNCLAIMED_DELIVERABLES=0
+
+for (( i=0; i<TOTAL; i++ )); do
+  if [[ "${speakers[$i]}" != "assistant" ]]; then continue; fi
+  block="${blocks[$i]}"
+
+  # Extract numbered list items (lines starting with "1." "2." etc.)
+  declare -a list_items=()
+  while IFS= read -r item_line; do
+    [[ -z "$item_line" ]] && continue
+    # Strip leading number + punctuation prefix
+    cleaned=$(printf '%s' "$item_line" | sed 's/^[[:space:]]*[0-9][0-9]*[.)][[:space:]]*//')
+    [[ -n "$cleaned" ]] && list_items+=("$cleaned")
+  done < <(printf '%s' "$block" | { /usr/bin/grep -E '^[[:space:]]*[0-9]+[.)][[:space:]]+' 2>/dev/null || true; })
+
+  num_items="${#list_items[@]}"
+  if [[ "$num_items" -lt 3 ]]; then
+    unset list_items
+    declare -a list_items=()
+    continue
+  fi
+
+  # Look at subsequent user blocks
+  for (( j=i+1; j<TOTAL; j++ )); do
+    if [[ "${speakers[$j]}" != "user" ]]; then continue; fi
+    user_block="${blocks[$j]}"
+
+    for item in "${list_items[@]}"; do
+      [[ -z "$item" ]] && continue
+
+      # Collect meaningful keywords from the list item (3+ char words)
+      item_words=()
+      while IFS= read -r w; do
+        [[ ${#w} -ge 3 ]] && item_words+=("$w")
+      done < <(printf '%s' "$item" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z' '\n' | sort -u)
+
+      [[ "${#item_words[@]}" -eq 0 ]] && continue
+
+      # Check how many keywords appear in the user block
+      user_mentions=0
+      for w in "${item_words[@]}"; do
+        if printf '%s' "$user_block" | /usr/bin/grep -qiE "\b${w}\b" 2>/dev/null; then
+          user_mentions=$(( user_mentions + 1 ))
+        fi
+      done
+
+      # Need at least 2 keyword matches to count as a reference
+      if [[ "$user_mentions" -lt 2 ]]; then continue; fi
+
+      # Check if any assistant block between i and j addressed this item
+      addressed=0
+      for (( k=i+1; k<j; k++ )); do
+        if [[ "${speakers[$k]}" != "assistant" ]]; then continue; fi
+        asst_mentions=0
+        for w in "${item_words[@]}"; do
+          if printf '%s' "${blocks[$k]}" | /usr/bin/grep -qiE "\b${w}\b" 2>/dev/null; then
+            asst_mentions=$(( asst_mentions + 1 ))
+          fi
+        done
+        if [[ "$asst_mentions" -ge 2 ]]; then
+          addressed=1
+          break
+        fi
+      done
+
+      if [[ "$addressed" -eq 0 ]]; then
+        UNCLAIMED_DELIVERABLES=$(( UNCLAIMED_DELIVERABLES + 1 ))
+      fi
+    done
+  done
+
+  unset list_items
+  declare -a list_items=()
+done
+
+# ---------------------------------------------------------------------------
+# Signal 5: Repetition Without Progress (+4 each)
+# Two user blocks more than 2 turns apart with >60% shared unique words.
+# ---------------------------------------------------------------------------
+REPETITIONS=0
+
+declare -a user_indices=()
+for (( i=0; i<TOTAL; i++ )); do
+  if [[ "${speakers[$i]}" == "user" ]]; then
+    user_indices+=("$i")
+  fi
+done
+
+NUSER="${#user_indices[@]}"
+REPETITION_WORD_THRESHOLD=60
+
+for (( a=0; a<NUSER-1; a++ )); do
+  for (( b=a+1; b<NUSER; b++ )); do
+    idx_a="${user_indices[$a]}"
+    idx_b="${user_indices[$b]}"
+    turn_gap=$(( idx_b - idx_a ))
+    # Must be more than 2 overall blocks apart
+    if [[ "$turn_gap" -le 2 ]]; then continue; fi
+
+    sim=$(word_similarity "${blocks[$idx_a]}" "${blocks[$idx_b]}")
+    if [[ "$sim" -gt "$REPETITION_WORD_THRESHOLD" ]]; then
+      REPETITIONS=$(( REPETITIONS + 1 ))
+    fi
+  done
+done
+
+# ---------------------------------------------------------------------------
+# Compute total score
+# ---------------------------------------------------------------------------
+
+S1=$(( CORRECTION_CYCLES * 2 + CORRECTION_BONUS ))  # correction cycles
+S2=$(( SORRY_LOOPS * 3 ))                            # sorry loops
+S3=$(( FRUSTRATION_SIGNALS * 2 ))                    # frustration events
+S4=$(( UNCLAIMED_DELIVERABLES * 3 ))                 # unclaimed deliverables
+S5=$(( REPETITIONS * 4 ))                            # repetitions
+
+TOTAL_SCORE=$(( S1 + S2 + S3 + S4 + S5 ))
+
+# ---------------------------------------------------------------------------
+# Determine overall color
+# ---------------------------------------------------------------------------
+
+if [[ "$TOTAL_SCORE" -le "$GREEN_MAX" ]]; then
+  OVERALL="green"
+elif [[ "$TOTAL_SCORE" -le "$YELLOW_MAX" ]]; then
+  OVERALL="yellow"
+else
+  OVERALL="red"
+fi
+
+# ---------------------------------------------------------------------------
+# Output JSON to stdout — no other output goes here
+# ---------------------------------------------------------------------------
+
+printf '{\n'
+printf '  "overall": "%s",\n'              "$OVERALL"
+printf '  "total_score": %d,\n'            "$TOTAL_SCORE"
+printf '  "correction_cycles": %d,\n'      "$CORRECTION_CYCLES"
+printf '  "sorry_loops": %d,\n'            "$SORRY_LOOPS"
+printf '  "frustration_signals": %d,\n'    "$FRUSTRATION_SIGNALS"
+printf '  "unclaimed_deliverables": %d,\n' "$UNCLAIMED_DELIVERABLES"
+printf '  "repetitions": %d\n'             "$REPETITIONS"
+printf '}\n'

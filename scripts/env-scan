@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# env-scan — gather Claude Code environment inventory and output as markdown
+# Usage: env-scan [session-dir]
+
+SESSION_DIR="${1:-}"
+
+SETTINGS="$HOME/.claude/settings.json"
+PLUGIN_CACHE="$HOME/.claude/plugins/cache"
+SKILLS_DIR="$HOME/.claude/skills"
+GLOBAL_CLAUDE_MD="$HOME/.claude/CLAUDE.md"
+MEMORY_MD="$HOME/.claude/projects/-Users-israelbitton/memory/MEMORY.md"
+REVIEWS_DIR="$HOME/.metareview/reviews"
+KNOWLEDGE_DIR="$HOME/.metareview/knowledge"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 1: Installed Plugins
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## Installed Plugins"
+echo ""
+if [[ -f "$SETTINGS" ]] && command -v jq &>/dev/null; then
+  plugins=$(jq -r '.enabledPlugins // {} | keys[]' "$SETTINGS" 2>/dev/null || true)
+  if [[ -n "$plugins" ]]; then
+    while IFS= read -r plugin; do
+      echo "- $plugin"
+    done <<< "$plugins"
+  else
+    echo "none"
+  fi
+else
+  echo "not found (settings.json missing or jq unavailable)"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 2: Available Skills
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## Available Skills"
+echo ""
+
+# Collect SKILL.md paths from plugin cache and user skills dir
+skill_files=()
+
+# Plugin cache: search for SKILL.md up to 5 levels deep, avoiding .git
+if [[ -d "$PLUGIN_CACHE" ]]; then
+  while IFS= read -r f; do
+    skill_files+=("$f")
+  done < <(find "$PLUGIN_CACHE" -maxdepth 6 -name "SKILL.md" 2>/dev/null | sort)
+fi
+
+# User skills: ~/.claude/skills/*/SKILL.md
+if [[ -d "$SKILLS_DIR" ]]; then
+  while IFS= read -r f; do
+    skill_files+=("$f")
+  done < <(find "$SKILLS_DIR" -maxdepth 3 -name "SKILL.md" 2>/dev/null | sort)
+fi
+
+if [[ ${#skill_files[@]} -eq 0 ]]; then
+  echo "none"
+else
+  declare -A seen_skills
+  for skill_path in "${skill_files[@]}"; do
+    # Skill name: parent directory of SKILL.md
+    skill_name=$(basename "$(dirname "$skill_path")")
+    # Skip if already printed this skill name
+    [[ -n "${seen_skills[$skill_name]+_}" ]] && continue
+    seen_skills[$skill_name]=1
+    # Description: first line starting with "description:" in YAML frontmatter
+    description=$(grep -m1 '^description:' "$skill_path" 2>/dev/null | sed 's/^description:[[:space:]]*//' | tr -d '"' || true)
+    if [[ -z "$description" ]]; then
+      description="(no description)"
+    fi
+    echo "- **$skill_name**: $description"
+  done
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 3: Configured Hooks
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## Configured Hooks"
+echo ""
+if [[ -f "$SETTINGS" ]] && command -v jq &>/dev/null; then
+  hook_keys=$(jq -r '.hooks // {} | keys[]' "$SETTINGS" 2>/dev/null || true)
+  if [[ -n "$hook_keys" ]]; then
+    while IFS= read -r hook_event; do
+      echo "### $hook_event"
+      commands=$(jq -r --arg ev "$hook_event" '.hooks[$ev][]?.hooks[]?.command // empty' "$SETTINGS" 2>/dev/null || true)
+      if [[ -n "$commands" ]]; then
+        while IFS= read -r cmd; do
+          echo "- \`$cmd\`"
+        done <<< "$commands"
+      else
+        echo "- (no commands)"
+      fi
+      echo ""
+    done <<< "$hook_keys"
+  else
+    echo "none"
+    echo ""
+  fi
+else
+  echo "not found"
+  echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 4: CLAUDE.md Instructions
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## CLAUDE.md Instructions"
+echo ""
+
+echo "### Global (~/.claude/CLAUDE.md)"
+echo ""
+if [[ -f "$GLOBAL_CLAUDE_MD" ]]; then
+  echo '```'
+  head -50 "$GLOBAL_CLAUDE_MD"
+  echo '```'
+else
+  echo "not found"
+fi
+echo ""
+
+# Project CLAUDE.md: use session-dir's cwd if available, else current pwd
+project_cwd=""
+if [[ -n "$SESSION_DIR" && -f "$SESSION_DIR/meta.json" ]] && command -v jq &>/dev/null; then
+  project_cwd=$(jq -r '.cwd // empty' "$SESSION_DIR/meta.json" 2>/dev/null || true)
+fi
+if [[ -z "$project_cwd" ]]; then
+  project_cwd="$(pwd)"
+fi
+
+echo "### Project ($project_cwd/CLAUDE.md)"
+echo ""
+if [[ -f "$project_cwd/CLAUDE.md" ]]; then
+  echo '```'
+  head -50 "$project_cwd/CLAUDE.md"
+  echo '```'
+else
+  echo "not found"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 5: Memory Index
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## Memory Index"
+echo ""
+if [[ -f "$MEMORY_MD" ]]; then
+  echo '```'
+  head -30 "$MEMORY_MD"
+  echo '```'
+else
+  echo "not found"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 6: Session Metadata
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## Session Metadata"
+echo ""
+if [[ -n "$SESSION_DIR" ]]; then
+  meta_file="$SESSION_DIR/meta.json"
+  if [[ -f "$meta_file" ]]; then
+    echo '```json'
+    cat "$meta_file"
+    echo '```'
+  else
+    echo "meta.json not found in: $SESSION_DIR"
+  fi
+else
+  echo "no session-dir provided"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 7: Prior Reviews
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## Prior Reviews"
+echo ""
+
+# Determine target cwd (from session meta.json if available)
+target_cwd=""
+if [[ -n "$SESSION_DIR" && -f "$SESSION_DIR/meta.json" ]] && command -v jq &>/dev/null; then
+  target_cwd=$(jq -r '.cwd // empty' "$SESSION_DIR/meta.json" 2>/dev/null || true)
+fi
+
+if [[ -z "$target_cwd" ]]; then
+  echo "no session-dir provided — cannot match prior reviews by cwd"
+else
+  found_any=false
+  if [[ -d "$REVIEWS_DIR" ]]; then
+    for review_dir in "$REVIEWS_DIR"/*/; do
+      [[ -d "$review_dir" ]] || continue
+      review_meta="$review_dir/meta.json"
+      review_md="$review_dir/REVIEW.md"
+
+      [[ -f "$review_meta" ]] || continue
+      [[ -f "$review_md" ]] || continue
+
+      review_cwd=$(jq -r '.cwd // empty' "$review_meta" 2>/dev/null || true)
+      if [[ "$review_cwd" == "$target_cwd" ]]; then
+        found_any=true
+        echo "### $(basename "$review_dir")"
+        echo ""
+        echo '```'
+        head -40 "$review_md"
+        echo '```'
+        echo ""
+      fi
+    done
+  fi
+  if [[ "$found_any" == "false" ]]; then
+    echo "none found for cwd: $target_cwd"
+  fi
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 8: Knowledge Base
+# ─────────────────────────────────────────────────────────────────────────────
+echo "## Knowledge Base"
+echo ""
+if [[ -d "$KNOWLEDGE_DIR" ]]; then
+  kb_files=("$KNOWLEDGE_DIR"/*.md)
+  # Check if glob matched anything
+  if [[ ${#kb_files[@]} -eq 0 ]] || [[ ! -f "${kb_files[0]}" ]]; then
+    echo "none"
+  else
+    for kb_file in "${kb_files[@]}"; do
+      [[ -f "$kb_file" ]] || continue
+      echo "### $(basename "$kb_file")"
+      echo ""
+      cat "$kb_file"
+      echo ""
+    done
+  fi
+else
+  echo "not found"
+fi

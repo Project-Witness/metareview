@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# clean-transcript — Transform raw terminal capture (raw.log) into a clean,
+# readable transcript (transcript.txt) with speaker boundary markers.
+#
+# Usage: clean-transcript <session-dir>
+
+# ---------------------------------------------------------------------------
+# Argument validation
+# ---------------------------------------------------------------------------
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: clean-transcript <session-dir>" >&2
+  exit 1
+fi
+
+SESSION_DIR="$1"
+RAW_LOG="${SESSION_DIR}/raw.log"
+TRANSCRIPT="${SESSION_DIR}/transcript.txt"
+
+if [[ ! -d "$SESSION_DIR" ]]; then
+  echo "Error: session directory not found: $SESSION_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -f "$RAW_LOG" ]]; then
+  echo "Error: raw.log not found in session directory: $RAW_LOG" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Cleaning pipeline implemented in Python (more reliable than pure sed/awk
+# for multi-byte Unicode, binary escape sequences, and complex state tracking)
+# ---------------------------------------------------------------------------
+
+python3 - "$RAW_LOG" "$TRANSCRIPT" <<'PYEOF'
+import sys
+import re
+import os
+
+src_path = sys.argv[1]
+dst_path = sys.argv[2]
+
+with open(src_path, "rb") as f:
+    raw = f.read()
+
+# ---------------------------------------------------------------------------
+# Step 1: Decode bytes — replace undecodable bytes with a replacement char
+# ---------------------------------------------------------------------------
+text = raw.decode("utf-8", errors="replace")
+
+# ---------------------------------------------------------------------------
+# Step 2: Remove alternate screen buffer content
+# Everything between ESC[?1049h (enter alt screen) and ESC[?1049l (exit)
+# including the escape sequences themselves.
+# ---------------------------------------------------------------------------
+text = re.sub(
+    r'\x1b\[\?1049h.*?\x1b\[\?1049l',
+    '',
+    text,
+    flags=re.DOTALL
+)
+
+# ---------------------------------------------------------------------------
+# Step 3: Strip remaining ANSI / VT100 escape sequences
+# Covers: CSI sequences (ESC [ ... m/H/J/K/A/B/C/D/etc),
+#         OSC sequences (ESC ] ... BEL/ST),
+#         cursor show/hide (ESC[?25h / ESC[?25l),
+#         and standalone ESC + single char sequences.
+# ---------------------------------------------------------------------------
+# CSI sequences: ESC [ <params> <letter>
+text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)
+# OSC sequences: ESC ] ... (BEL or ESC \)
+text = re.sub(r'\x1b\].*?(?:\x07|\x1b\\)', '', text, flags=re.DOTALL)
+# Remaining standalone ESC sequences: ESC + one char
+text = re.sub(r'\x1b.', '', text)
+
+# ---------------------------------------------------------------------------
+# Step 4: Normalize line endings — CR+LF → LF, lone CR → LF
+# ---------------------------------------------------------------------------
+text = text.replace('\r\n', '\n')
+text = text.replace('\r', '\n')
+
+# ---------------------------------------------------------------------------
+# Step 5: Collapse spinner lines
+# Spinner chars: entire Braille Patterns block (U+2800–U+28FF) covers all
+# variants used by Claude Code spinners, plus ASCII line-spinner chars.
+# A line consisting only of a spinner glyph (optionally followed by text)
+# is a progress animation line — remove it entirely.
+# ---------------------------------------------------------------------------
+# Match any Braille block character OR ASCII spinner chars
+SPINNER_CHARS = r'[\u2800-\u28ff|/\\\-]'
+lines_raw = text.split('\n')
+lines = []
+for line in lines_raw:
+    stripped = line.strip()
+    # Drop lines that are purely a spinner glyph (optionally followed by space + text)
+    if re.match(r'^' + SPINNER_CHARS + r'(\s.*)?$', stripped):
+        continue
+    lines.append(line)
+
+text = '\n'.join(lines)
+
+# ---------------------------------------------------------------------------
+# Step 6: Trim trailing whitespace per line
+# ---------------------------------------------------------------------------
+lines = [l.rstrip() for l in text.split('\n')]
+text = '\n'.join(lines)
+
+# ---------------------------------------------------------------------------
+# Step 7: Collapse runs of 3+ empty lines → max 2 empty lines
+# ---------------------------------------------------------------------------
+text = re.sub(r'\n{4,}', '\n\n\n', text)
+
+# Strip leading/trailing blank lines from the whole document
+text = text.strip('\n') + '\n'
+
+# ---------------------------------------------------------------------------
+# Step 8: Mark speaker boundaries
+#
+# Heuristic: lines that start with "> " (possibly with leading whitespace)
+# are user prompt lines (the Claude Code shell prompt echoes typed input
+# as "> <text>").  All other content is assistant output.
+#
+# We scan line-by-line, track the current "speaker", and insert markers
+# whenever the speaker changes.
+# ---------------------------------------------------------------------------
+
+USER_MARKER      = '--- USER ---'
+ASSISTANT_MARKER = '--- ASSISTANT ---'
+
+# Regex: line that is a user prompt input line
+# Matches:  "> some text"  or  "> " (blank prompt)
+USER_LINE_RE = re.compile(r'^\s*>\s')
+
+output_lines = []
+current_speaker = None  # None means we haven't started yet
+
+for line in text.split('\n'):
+    if USER_LINE_RE.match(line):
+        if current_speaker != 'user':
+            if output_lines:
+                output_lines.append('')
+            output_lines.append(USER_MARKER)
+            output_lines.append('')
+            current_speaker = 'user'
+        # Strip the "> " prefix for cleaner output
+        output_lines.append(re.sub(r'^\s*>\s?', '', line))
+    else:
+        if current_speaker != 'assistant':
+            if output_lines:
+                output_lines.append('')
+            output_lines.append(ASSISTANT_MARKER)
+            output_lines.append('')
+            current_speaker = 'assistant'
+        output_lines.append(line)
+
+result = '\n'.join(output_lines)
+
+# Final cleanup: collapse 3+ blank lines again after marker insertion
+result = re.sub(r'\n{4,}', '\n\n\n', result)
+result = result.strip('\n') + '\n'
+
+with open(dst_path, 'w', encoding='utf-8') as f:
+    f.write(result)
+
+PYEOF
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+SIZE=$(wc -c < "$TRANSCRIPT" | tr -d ' ')
+LINES=$(wc -l < "$TRANSCRIPT" | tr -d ' ')
+echo "clean-transcript: wrote ${TRANSCRIPT} (${SIZE} bytes, ${LINES} lines)"

@@ -1,0 +1,17 @@
+{
+  "name": "metareview-marketplace",
+  "owner": {
+    "name": "Project-Witness"
+  },
+  "plugins": [
+    {
+      "name": "metareview",
+      "source": "./",
+      "description": "Claude Code session quality auditor — captures, analyzes, and improves your AI coding sessions",
+      "version": "0.1.0",
+      "author": {
+        "name": "Israel Bitton"
+      }
+    }
+  ]
+}

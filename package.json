@@ -1,0 +1,11 @@
+{
+  "name": "metareview",
+  "version": "0.1.0",
+  "description": "Claude Code session quality auditor",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Project-Witness/metareview.git"
+  }
+}
